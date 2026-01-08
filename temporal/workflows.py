@@ -150,9 +150,16 @@ class TransactionProcessingWorkflow:
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=RetryPolicy(maximum_attempts=1)
                 )
-            except:
-                pass
-            raise
+            except Exception as comp_e:
+                workflow.logger.error(f"Compensation failed: {comp_e}", exc_info=True)
+                # Still raise original exception to fail workflow
+            
+            # Explicitly fail workflow with ApplicationError
+            from temporalio.exceptions import ApplicationError
+            raise ApplicationError(
+                f"Workflow failed: {str(e)}",
+                type="WorkflowExecutionError"
+            ) from e
     
     async def _generate_embedding(self, transaction_details: TransactionDetails) -> List[float]:
         """Generate embedding activity wrapper."""
@@ -253,14 +260,16 @@ class TransactionProcessingWorkflow:
             )
             
             # Update decision based on human review
-            if self.human_review_decision:
+            if self.human_review_decision and self.state.decision_result:
                 self.state.decision_result.decision = self.human_review_decision
                 workflow.logger.info(f"Human review decision received: {self.human_review_decision}")
         except TimeoutError:
             workflow.logger.warning(f"Human review timeout for transaction {self.state.transaction_id}")
             # Default to reject on timeout
-            self.state.decision_result.decision = "reject"
-            self.state.decision_result.reasoning["primary_reasoning"] = "Human review timeout - defaulting to reject"
+            if self.state.decision_result:
+                self.state.decision_result.decision = "reject"
+                if self.state.decision_result.reasoning:
+                    self.state.decision_result.reasoning["primary_reasoning"] = "Human review timeout - defaulting to reject"
     
     @workflow.signal
     def human_review_complete(self, decision: str) -> None:
@@ -308,7 +317,11 @@ class TransactionProcessingWorkflow:
             "reject": "rejected",
             "escalate": "pending_review"
         }
-        new_status = status_map.get(self.state.decision_result.decision, "pending")
+        # Add null check for decision_result
+        if self.state.decision_result:
+            new_status = status_map.get(self.state.decision_result.decision, "pending")
+        else:
+            new_status = "pending"
         
         await workflow.execute_activity(
             update_transaction_status,
