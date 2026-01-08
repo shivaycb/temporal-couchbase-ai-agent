@@ -1,221 +1,99 @@
-"""Embedding client with Voyage AI primary and Cohere fallback."""
+"""OpenAI embedding client for transaction embeddings."""
 
-import json
+import os
 import logging
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-
+from typing import List, Optional, Dict
+from openai import OpenAI
 from utils.config import config
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class EmbeddingResult:
-    """Result of embedding generation."""
-    embedding: List[float]
-    model: str
-    dimensions: int
-
 class EmbeddingClient:
-    """Unified embedding client with Voyage primary and Cohere fallback."""
-
+    """Client for generating embeddings using OpenAI."""
+    
     def __init__(self):
-        """Initialize the embedding client."""
-        self._voyage_client = None
-        self._bedrock_client = None
-        self._initialize_clients()
-
-    def _initialize_clients(self):
-        """Initialize embedding provider clients."""
-        # Initialize Voyage client if API key is available
-        if config.VOYAGE_API_KEY:
+        """Initialize OpenAI embedding client."""
+        self._client = None
+        self.model = config.OPENAI_EMBEDDING_MODEL
+        self.primary_model = "openai"
+        self.api_key = config.OPENAI_API_KEY
+    
+    @property
+    def client(self):
+        """Lazy initialization of OpenAI client (for Temporal compatibility)."""
+        if self._client is None and self.api_key:
             try:
-                import voyageai
-                self._voyage_client = voyageai.Client(api_key=config.VOYAGE_API_KEY)
-                logger.info("Voyage AI client initialized successfully")
-            except ImportError:
-                logger.warning("voyageai package not installed, falling back to Cohere only")
+                self._client = OpenAI(api_key=self.api_key)
+                logger.info(f"Initialized OpenAI embedding client with model: {self.model}")
             except Exception as e:
-                logger.warning(f"Failed to initialize Voyage client: {e}")
-        else:
-            logger.info("VOYAGE_API_KEY not set, using Cohere only")
-
-        # Initialize Bedrock client for Cohere fallback
-        try:
-            import boto3
-            self._bedrock_client = boto3.client(
-                'bedrock-runtime',
-                region_name=config.AWS_REGION,
-                aws_access_key_id=config.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY
-            )
-            logger.info("Bedrock client initialized for Cohere fallback")
-        except Exception as e:
-            logger.error(f"Failed to initialize Bedrock client: {e}")
-
-    async def get_embedding(self, text: str) -> EmbeddingResult:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
+                self._client = None
+        return self._client
+    
+    def generate_embedding(self, text: str) -> Optional[List[float]]:
         """
-        Generate embedding using Voyage finance-2 with Cohere fallback.
-
+        Generate embedding for a given text.
+        
         Args:
             text: Text to embed
-
+            
         Returns:
-            EmbeddingResult containing embedding, model used, and dimensions
-
-        Raises:
-            Exception: If both Voyage and Cohere fail
+            List of floats representing the embedding, or None if generation fails
         """
-        # Try Voyage first if available
-        if self._voyage_client:
-            try:
-                return await self._get_voyage_embedding(text)
-            except Exception as voyage_error:
-                logger.warning(f"Voyage embedding failed, falling back to Cohere: {voyage_error}")
-
-        # Fallback to Cohere via Bedrock
-        if self._bedrock_client:
-            try:
-                return await self._get_cohere_embedding(text)
-            except Exception as cohere_error:
-                logger.error(f"Cohere embedding failed: {cohere_error}")
-                raise Exception(f"Both embedding providers failed. Voyage: {voyage_error if 'voyage_error' in locals() else 'Not attempted'}, Cohere: {cohere_error}")
-
-        raise Exception("No embedding providers available")
-
-    async def _get_voyage_embedding(self, text: str) -> EmbeddingResult:
-        """Generate embedding using Voyage finance-2 model."""
+        if not self.client:
+            logger.warning("OpenAI client not available. Returning mock embedding.")
+            return self._mock_embedding()
+        
         try:
-            result = self._voyage_client.embed(
-                texts=[text],
-                model=config.VOYAGE_MODEL,
-                input_type="document"
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=text
             )
-
-            embedding = result.embeddings[0]
-
-            logger.debug(f"Successfully generated Voyage embedding with {len(embedding)} dimensions")
-
-            return EmbeddingResult(
-                embedding=embedding,
-                model=config.VOYAGE_MODEL,
-                dimensions=len(embedding)
-            )
-
+            return response.data[0].embedding
         except Exception as e:
-            logger.error(f"Voyage embedding generation failed: {e}")
-            raise
-
-    async def _get_cohere_embedding(self, text: str) -> EmbeddingResult:
-        """Generate embedding using Cohere via Bedrock."""
-        try:
-            response = self._bedrock_client.invoke_model(
-                modelId=config.COHERE_MODEL,
-                body=json.dumps({
-                    "texts": [text],
-                    "input_type": "search_document",
-                    "truncate": "END"
-                })
-            )
-
-            result = json.loads(response['body'].read())
-            embedding = result['embeddings'][0]
-
-            logger.debug(f"Successfully generated Cohere embedding with {len(embedding)} dimensions")
-
-            return EmbeddingResult(
-                embedding=embedding,
-                model=config.COHERE_MODEL,
-                dimensions=len(embedding)
-            )
-
-        except Exception as e:
-            logger.error(f"Cohere embedding generation failed: {e}")
-            raise
-
-    def prepare_transaction_text(self, transaction: Dict[str, Any], enriched_data: Optional[Dict[str, Any]] = None) -> str:
+            logger.error(f"Error generating embedding: {e}")
+            return self._mock_embedding()
+    
+    def generate_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         """
-        Prepare transaction data for embedding generation with finance-specific features.
-
+        Generate embeddings for multiple texts.
+        
         Args:
-            transaction: Transaction data
-            enriched_data: Additional enriched data
-
+            texts: List of texts to embed
+            
         Returns:
-            Formatted text optimized for financial domain embedding
+            List of embeddings (or None for failed generations)
         """
-        # Build comprehensive text representation for financial analysis
-        embedding_text = f"""
-Transaction Type: {transaction.get('transaction_type', 'unknown')}
-Amount: {transaction.get('amount', 0)} {transaction.get('currency', 'USD')}
-Time Pattern: {self._classify_time_pattern(transaction.get('timestamp'))}
-Geographic Risk: {transaction.get('sender', {}).get('country', 'Unknown')} to {transaction.get('recipient', {}).get('country', 'Unknown')}
-Account Age: {transaction.get('sender', {}).get('account_age_days', 'Unknown')} days
-Business Context: {transaction.get('business_purpose', 'personal')}
-Payment Method: {transaction.get('payment_method', 'wire')}
-"""
-
-        # Add enriched data if available
-        if enriched_data:
-            risk_flags = enriched_data.get('risk_flags', [])
-            if risk_flags:
-                embedding_text += f"Risk Flags: {', '.join(risk_flags)}\n"
-
-            regulatory_flags = enriched_data.get('regulatory_flags', [])
-            if regulatory_flags:
-                embedding_text += f"Regulatory Flags: {', '.join(regulatory_flags)}\n"
-
-            velocity_context = enriched_data.get('velocity_1h', 0)
-            if velocity_context:
-                embedding_text += f"Velocity Context: {velocity_context} transactions in 1 hour\n"
-
-        return embedding_text.strip()
-
-    def _classify_time_pattern(self, timestamp) -> str:
-        """Classify transaction timing pattern for embedding."""
-        if not timestamp:
-            return "unknown"
-
+        if not self.client:
+            logger.warning("OpenAI client not available. Returning mock embeddings.")
+            return [self._mock_embedding() for _ in texts]
+        
         try:
-            from datetime import datetime
-            if isinstance(timestamp, str):
-                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            else:
-                dt = timestamp
-
-            hour = dt.hour
-            weekday = dt.weekday()
-
-            # Business hours check
-            if 9 <= hour <= 17 and weekday < 5:
-                return "business_hours"
-            elif weekday >= 5:
-                return "weekend"
-            elif hour < 6 or hour > 22:
-                return "unusual_hours"
-            else:
-                return "off_hours"
-
-        except Exception:
-            return "unknown"
-
-    def get_available_models(self) -> List[str]:
-        """Get list of available embedding models."""
-        models = []
-        if self._voyage_client:
-            models.append(config.VOYAGE_MODEL)
-        if self._bedrock_client:
-            models.append(config.COHERE_MODEL)
-        return models
-
-    def health_check(self) -> Dict[str, Any]:
-        """Check health of embedding providers."""
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=texts
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Error generating batch embeddings: {e}")
+            return [self._mock_embedding() for _ in texts]
+    
+    def _mock_embedding(self, dimensions: int = 1536) -> List[float]:
+        """Generate a mock embedding for testing when API is unavailable."""
+        import random
+        return [random.gauss(0, 0.1) for _ in range(dimensions)]
+    
+    def health_check(self) -> Dict:
+        """Check the health status of the embedding service."""
+        openai_available = self.client is not None
+        
         return {
-            "voyage_available": self._voyage_client is not None,
-            "cohere_available": self._bedrock_client is not None,
-            "primary_model": config.VOYAGE_MODEL if self._voyage_client else config.COHERE_MODEL,
-            "available_models": self.get_available_models()
+            "primary_model": self.primary_model,
+            "openai_available": openai_available,
+            "model": self.model,
+            "available_models": ["openai"] if openai_available else []
         }
 
-# Singleton instance
+# Global instance
 embedding_client = EmbeddingClient()
+

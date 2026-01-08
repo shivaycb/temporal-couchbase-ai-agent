@@ -27,7 +27,7 @@ pip install -r requirements.txt
 if [ ! -f ".env" ]; then
     echo "📝 Creating .env file from template..."
     cp .env.example .env
-    echo "⚠️  Please edit .env with your couchbaseDB URI and AWS credentials"
+    echo "⚠️  Please edit .env with your couchbaseDB URI and OpenAI credentials"
     echo "   Then re-run this script to complete setup."
     exit 1
 fi
@@ -38,12 +38,12 @@ export $(cat .env | grep -v '^#' | xargs)
 # Check required environment variables
 if [ -z "$couchbaseDB_URI" ]; then
     echo "❌ couchbaseDB_URI not set in .env file"
-    echo "   Please add your couchbaseDB connection string"
+    echo "   Please add your couchbaseDB Capella connection string"
     exit 1
 fi
 
-if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-    echo "⚠️  AWS credentials not set. AI features will use mock mode."
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "⚠️  OpenAI API key not set. AI features will use mock mode."
 fi
 
 # Start Docker services

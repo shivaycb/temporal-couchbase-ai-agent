@@ -1,52 +1,36 @@
-"""Shared constants and data models for Temporal workflows."""
+"""Shared types and constants for Temporal workflows."""
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Union
-from datetime import datetime
-from decimal import Decimal
+from typing import Dict, List, Optional
 
-# Task Queue name
-TRANSACTION_PROCESSING_TASK_QUEUE = "transaction-processing-queue"
+# Task queue name
+TRANSACTION_PROCESSING_TASK_QUEUE = "transaction-processing"
 
 @dataclass
 class TransactionDetails:
-    """Extended transaction details for processing."""
+    """Transaction details passed to workflow."""
     transaction_id: str
-    transaction_type: str  # Changed from TransactionType enum to str for serialization
-    amount: Union[float, str]  # Accept float or string for Decimal conversion
+    transaction_type: str
+    amount: str
     currency: str
-    sender: Dict[str, Any]
-    recipient: Dict[str, Any]
-    reference_number: str
-    risk_flags: List[str]
-    metadata: Dict[str, Any]
+    sender: Dict
+    recipient: Dict
+    reference_number: Optional[str] = None
+    risk_flags: List[str] = None
+    metadata: Dict = None
+    
+    def __post_init__(self):
+        if self.risk_flags is None:
+            self.risk_flags = []
+        if self.metadata is None:
+            self.metadata = {}
 
 @dataclass
-class ProcessingResult:
-    """Result of transaction processing."""
-    success: bool
-    decision: str  # Changed to str for better serialization
-    confidence: Union[float, str]
-    message: str
-    decision_id: Optional[str] = None
-    risk_score: Optional[Union[float, str]] = None
-    processing_time_ms: Optional[int] = None
-    workflow_id: Optional[str] = None
-
-@dataclass
-class RiskAssessment:
-    """Risk assessment results."""
-    risk_score: Union[float, str]
-    risk_level: str
+class DecisionResult:
+    """Result of transaction decision."""
+    decision: str  # "approve", "reject", "escalate"
+    confidence: float
+    risk_score: float
+    reasoning: Dict
     risk_factors: List[str]
-    requires_enhanced_diligence: bool
-    compliance_checks: Dict[str, bool]
 
-# Exceptions
-class InsufficientDataError(Exception):
-    """Raised when insufficient data for decision."""
-    pass
-
-class SystemError(Exception):
-    """Raised for system-level errors."""
-    pass

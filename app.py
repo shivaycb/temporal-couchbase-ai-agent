@@ -128,6 +128,25 @@ async def get_metrics():
             pass
     return None
 
+def run_async_safe(coro):
+    """Safely run async code in Streamlit (handles uvloop)."""
+    import concurrent.futures
+    
+    def run_in_thread():
+        """Run async code in a new event loop in a separate thread."""
+        return asyncio.run(coro)
+    
+    try:
+        # Check if we're in a running event loop
+        asyncio.get_running_loop()
+        # If we are, use ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(run_in_thread)
+            return future.result(timeout=60)
+    except RuntimeError:
+        # No running loop, we can use asyncio.run directly
+        return asyncio.run(coro)
+
 async def get_workflow_status(workflow_id: str):
     """Get Temporal workflow status."""
     async with httpx.AsyncClient() as client:
@@ -191,10 +210,14 @@ with col2:
 with col3:
     st.metric("Last Update", st.session_state.last_refresh.strftime("%H:%M:%S"))
 
-# Fetch metrics
-metrics = asyncio.run(get_metrics())
-if metrics:
-    st.session_state.metrics = metrics
+# Fetch metrics (at module level, this should be safe)
+try:
+    metrics = run_async_safe(get_metrics())
+    if metrics:
+        st.session_state.metrics = metrics
+except Exception:
+    # Silently fail at module level
+    pass
 
 # Sidebar - Scenario Launcher
 with st.sidebar:
@@ -223,11 +246,22 @@ with st.sidebar:
         # Run scenario button
         if st.button("▶️ Run Scenario", type="primary", width='stretch'):
             with st.spinner("Executing scenario..."):
-                result = asyncio.run(scenarios.run_scenario(selected_scenario))
-                st.session_state.scenario_results.append(result)
-                st.session_state.active_workflows.extend(result["workflow_ids"])
-                st.success(f"✅ Submitted {len(result['transactions'])} transactions")
-                st.rerun()
+                try:
+                    # Handle async execution in Streamlit
+                    result = run_async_safe(scenarios.run_scenario(selected_scenario))
+                    
+                    st.session_state.scenario_results.append(result)
+                    st.session_state.active_workflows.extend(result.get("workflow_ids", []))
+                    transaction_count = len(result.get('transactions', []))
+                    if transaction_count > 0:
+                        st.success(f"✅ Submitted {transaction_count} transaction(s)")
+                    else:
+                        st.warning("⚠️ No transactions were processed")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error running scenario: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
     
     st.divider()
     
@@ -338,7 +372,7 @@ with tabs[0]:  # Dashboard
             st.markdown("#### 🎯 Key Features")
             st.success("✅ Couchbase Vector Search (FTS)")
             st.info("🔄 Temporal Workflow Orchestration")
-            st.warning("🤖 AWS Bedrock AI Analysis")
+            st.warning("🤖 OpenAI AI Analysis")
             st.error("🛡️ Real-time Fraud Detection")
 
 with tabs[1]:  # Active Workflows
@@ -357,7 +391,7 @@ with tabs[1]:  # Active Workflows
                     txn_id = "-".join(parts[2:])
                     
                     # Get transaction status
-                    decision_data = asyncio.run(get_decision(txn_id))
+                    decision_data = run_async_safe(get_decision(txn_id))
                     
                     if decision_data and "decision" in decision_data:
                         if decision_data["decision"] == "approve":
@@ -392,23 +426,65 @@ with tabs[2]:  # Scenario Results
                 
                 with col3:
                     st.markdown("**Transactions:**")
-                    for txn in result['transactions']:
-                        if txn['status'] == 'submitted':
-                            amount_value = float(from_decimal(txn.get('amount', 0)))
+                    for txn in result.get('transactions', []):
+                        amount = txn.get('amount', 0)
+                        # Handle both Decimal and float/int
+                        try:
+                            if isinstance(amount, (int, float)):
+                                amount_value = float(amount)
+                            else:
+                                amount_value = float(from_decimal(amount))
+                        except (ValueError, TypeError):
+                            amount_value = 0.0
+                        
+                        status = txn.get('status', 'unknown')
+                        if status in ['submitted', 'completed']:
                             st.success(f"✅ ${amount_value:,.2f}")
+                        elif status == 'error':
+                            st.error(f"❌ ${amount_value:,.2f} - Error")
                         else:
-                            amount_value = float(from_decimal(txn.get('amount', 0)))
-                            st.error(f"❌ ${amount_value:,.2f}")
+                            st.warning(f"⚠️ ${amount_value:,.2f} - {status}")
                 
                 # Check actual results
-                if result['workflow_ids']:
+                if result.get('integration_test_results'):
+                    # Special handling for integration test results
+                    st.markdown("**Integration Test Results:**")
+                    test_results = result['integration_test_results']
+                    
+                    if test_results.get('workflow_result'):
+                        wf_result = test_results['workflow_result']
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Decision", wf_result.get('decision', 'N/A').upper())
+                        with col2:
+                            st.metric("Confidence", f"{wf_result.get('confidence', 0):.1f}%")
+                        with col3:
+                            st.metric("Risk Score", f"{wf_result.get('risk_score', 0):.1f}")
+                        with col4:
+                            st.metric("Processing Time", f"{wf_result.get('processing_time_ms', 0)}ms")
+                    
+                    if test_results.get('decision_in_db'):
+                        st.success("✅ Decision saved to database")
+                        if test_results.get('decision_details'):
+                            st.json(test_results['decision_details'])
+                    
+                    if test_results.get('transaction_status'):
+                        st.info(f"📊 Transaction Status: {test_results['transaction_status']}")
+                    
+                    if test_results.get('signal_sent'):
+                        st.success("✅ Human review signal sent automatically")
+                    
+                    if test_results.get('error'):
+                        st.error(f"❌ Error: {test_results['error']}")
+                
+                elif result['workflow_ids']:
                     st.markdown("**Actual Results:**")
                     results_data = []
                     for wf_id in result['workflow_ids']:
                         parts = wf_id.split("-")
                         if len(parts) >= 3:
                             txn_id = "-".join(parts[2:])
-                            decision_data = asyncio.run(get_decision(txn_id))
+                            decision_data = run_async_safe(get_decision(txn_id))
                             if decision_data:
                                 # Ensure Risk Score is always a string for consistent dataframe types
                                 risk_score = decision_data.get("risk_score")
@@ -717,7 +793,7 @@ with tabs[4]:  # Multi-Method Search Demo
             st.info("""
             **How Vector Search Works:**
 
-            • Transactions are converted to 1024-dimensional embeddings using Voyage AI or AWS Bedrock (Cohere)
+            • Transactions are converted to embeddings using OpenAI (text-embedding-3-small)
             • Couchbase FTS performs k-NN search to find semantically similar transactions
             • Captures behavioral patterns beyond exact field matches
             • Identifies fraud patterns even with different amounts or parties
@@ -728,8 +804,8 @@ with tabs[4]:  # Multi-Method Search Demo
             st.code("""
 {
     "index": "transaction_vector_index",
-    "embedding_model": "cohere-embed",
-    "dimensions": 1024,
+    "embedding_model": "text-embedding-3-small",
+    "dimensions": 1536,
     "similarity_metric": "cosine",
     "num_candidates": 100,
     "limit": 10
@@ -1119,7 +1195,7 @@ with tabs[5]:  # Settings
 
         This demonstration showcases an enterprise-grade financial transaction processing system that combines:
 
-        - **🧠 AI-Powered Decision Making**: AWS Bedrock (Claude & Cohere) for intelligent fraud detection
+        - **🧠 AI-Powered Decision Making**: OpenAI (GPT-4 & Text Embeddings) for intelligent fraud detection
         - **🔄 Workflow Orchestration**: Temporal for reliable, distributed transaction processing
         - **🗄️ Advanced Data Management**: Couchbase with Full-Text Search and vector capabilities
         - **📊 Real-time Monitoring**: Live dashboards and analytics
@@ -1137,7 +1213,7 @@ with tabs[5]:  # Settings
         ### ✨ Key Features
 
         **🔍 Hybrid Search Methods**
-        - Vector similarity search (1024-dimensional embeddings)
+        - Vector similarity search (1536-dimensional embeddings)
         - Traditional Couchbase indexes for exact matches
         - Feature-based scoring with weighted factors
         - Graph traversal for network analysis
@@ -1169,7 +1245,7 @@ with tabs[5]:  # Settings
         |-----------|------------|---------|
         | **Database** | Couchbase Enterprise | Vector search (FTS), ACID transactions, N1QL queries |
         | **Workflow** | Temporal.io | Durable execution, retries, compensation |
-        | **AI/ML** | AWS Bedrock | Claude (reasoning), Cohere (embeddings) |
+        | **AI/ML** | OpenAI | GPT-4 (reasoning), Text Embeddings (embeddings) |
         | **Backend** | FastAPI | REST API, async processing |
         | **Frontend** | Streamlit | Real-time dashboard |
         | **Infrastructure** | Docker | Containerized microservices |
@@ -1224,9 +1300,8 @@ with tabs[5]:  # Settings
         st.json({
             "Couchbase": "Connected",
             "Temporal Server": config.TEMPORAL_HOST,
-            "AWS Region": config.AWS_REGION,
-            "Bedrock Model": config.BEDROCK_MODEL_VERSION,
-            "Groq Model": config.GROQ_MODEL_ID,
+            "OpenAI Model": config.OPENAI_MODEL,
+            "OpenAI Embedding Model": config.OPENAI_EMBEDDING_MODEL,
             "Task Queue": config.TEMPORAL_TASK_QUEUE
         })
 
@@ -1235,6 +1310,6 @@ st.divider()
 st.markdown("""
 <div style='text-align: center'>
     <p>Powered by <b>Couchbase</b> 🗄️ and <b>Temporal Workflows</b> ⚙️</p>
-    <p>AI Analysis by <b>AWS Bedrock / Groq</b> (Claude / OpenAI & VoyageAI / Cohere) 🤖</p>
+    <p>AI Analysis by <b>OpenAI</b> (GPT-4 & Text Embeddings) 🤖</p>
 </div>
 """, unsafe_allow_html=True)

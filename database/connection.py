@@ -1,220 +1,123 @@
-"""Couchbase connection management."""
+"""Couchbase database connection management."""
 
-from datetime import timedelta
-from couchbase.auth import PasswordAuthenticator
-from couchbase.cluster import Cluster
-from couchbase.options import ClusterOptions, ClusterTimeoutOptions, QueryOptions
-from couchbase.management.collections import CollectionSpec
-from couchbase.management.queries import (
-    CreatePrimaryQueryIndexOptions,
-    CreateQueryIndexOptions,
-)
-from utils.config import config
 import logging
+from typing import Optional
+from datetime import timedelta
+from utils.config import config
 
 logger = logging.getLogger(__name__)
 
+# Use async couchbase for async operations
+from acouchbase.cluster import Cluster as AsyncCluster
 
-class CouchbaseDB:
-    """Couchbase database connection manager."""
+# Use sync couchbase for sync operations (Streamlit)
+from couchbase.cluster import Cluster
 
-    cluster: Cluster = None
-    bucket = None
-    scope = None
+# Shared options classes
+from couchbase.options import ClusterOptions
+from couchbase.auth import PasswordAuthenticator
 
-    def __init__(self):
-        self.collections = {}
+# Global connection objects (async)
+_cluster: Optional[AsyncCluster] = None
+_bucket = None
+_scope = None
+_db = None
 
-
-# Global database instance
-db = CouchbaseDB()
-
+# Sync connection objects (for Streamlit)
+_sync_cluster: Optional[Cluster] = None
+_sync_scope = None
 
 async def connect_to_couchbase():
-    """Create Couchbase connection."""
+    """Connect to Couchbase cluster."""
+    global _cluster, _bucket, _scope, _db
+    
+    if _cluster is not None:
+        logger.info("Already connected to Couchbase")
+        return
+    
+    # Validate connection string
+    if not config.COUCHBASE_CONNECTION_STRING:
+        raise ValueError("COUCHBASE_CONNECTION_STRING is not set. Please check your .env file.")
+    
+    if not config.COUCHBASE_USERNAME or not config.COUCHBASE_PASSWORD:
+        raise ValueError("COUCHBASE_USERNAME and COUCHBASE_PASSWORD must be set. Please check your .env file.")
+    
     try:
-        # Configure authentication
-        auth = PasswordAuthenticator(
-            config.COUCHBASE_USERNAME,
-            config.COUCHBASE_PASSWORD
-        )
-
-        # Configure timeouts
-        timeout_options = ClusterTimeoutOptions(
-            kv_timeout=timedelta(seconds=10),
-            query_timeout=timedelta(seconds=75),
-            search_timeout=timedelta(seconds=75)
-        )
-
-        # Connect to cluster
-        db.cluster = Cluster(
-            config.COUCHBASE_CONNECTION_STRING,
-            ClusterOptions(auth, timeout_options=timeout_options)
-        )
-
-        # Wait until cluster is ready
-        db.cluster.wait_until_ready(timedelta(seconds=10))
-
-        # Get bucket and scope
-        db.bucket = db.cluster.bucket(config.COUCHBASE_BUCKET)
-        db.scope = db.bucket.scope(config.COUCHBASE_SCOPE)
-
-        # Initialize collections
-        _initialize_collections()
-
-        # Create indexes
-        await create_indexes()
-
-        logger.info("Connected to Couchbase")
+        logger.info(f"Connecting to Couchbase: {config.COUCHBASE_CONNECTION_STRING}")
+        logger.info(f"Bucket: {config.COUCHBASE_BUCKET}, Scope: {config.COUCHBASE_SCOPE}")
+        auth = PasswordAuthenticator(config.COUCHBASE_USERNAME, config.COUCHBASE_PASSWORD)
+        cluster_options = ClusterOptions(auth)
+        
+        _cluster = await AsyncCluster.connect(config.COUCHBASE_CONNECTION_STRING, cluster_options)
+        await _cluster.wait_until_ready(timedelta(seconds=30))
+        
+        _bucket = _cluster.bucket(config.COUCHBASE_BUCKET)
+        await _bucket.on_connect()
+        _scope = _bucket.scope(config.COUCHBASE_SCOPE)
+        _db = _scope
+        
+        # Set module-level db
+        import database.connection as conn_module
+        conn_module.db = _db
+        
+        logger.info(f"✅ Connected to Couchbase bucket: {config.COUCHBASE_BUCKET}")
     except Exception as e:
-        logger.error(f"Could not connect to Couchbase: {e}")
+        logger.error(f"Failed to connect to Couchbase: {e}")
         raise
-
 
 async def close_couchbase_connection():
     """Close Couchbase connection."""
-    if db.cluster:
-        db.cluster.close()
-        logger.info("Disconnected from Couchbase")
+    global _cluster, _bucket, _scope, _db
+    if _cluster:
+        # Couchbase SDK handles cleanup automatically
+        _cluster = None
+        _bucket = None
+        _scope = None
+        _db = None
+        logger.info("Couchbase connection closed")
 
-
-def _initialize_collections():
-    """Initialize collection references."""
-    db.collections = {
-        'customers': db.scope.collection(config.CUSTOMERS_COLLECTION),
-        'transactions': db.scope.collection(config.TRANSACTIONS_COLLECTION),
-        'decisions': db.scope.collection(config.DECISIONS_COLLECTION),
-        'human_reviews': db.scope.collection(config.HUMAN_REVIEWS_COLLECTION),
-        'audit_events': db.scope.collection(config.AUDIT_EVENTS_COLLECTION),
-        'notifications': db.scope.collection(config.NOTIFICATIONS_COLLECTION),
-        'system_metrics': db.scope.collection(config.SYSTEM_METRICS_COLLECTION),
-        'rules': db.scope.collection(config.RULES_COLLECTION),
-        'accounts': db.scope.collection(config.ACCOUNTS_COLLECTION),
-        'journal': db.scope.collection(config.JOURNAL_COLLECTION),
-        'balance_updates': db.scope.collection(config.BALANCE_UPDATES_COLLECTION),
-        'holds': db.scope.collection(config.HOLDS_COLLECTION),
-    }
-
-
-async def create_indexes():
-    """Create necessary indexes using N1QL."""
-    try:
-        query_index_manager = db.cluster.query_indexes()
-        bucket_name = config.COUCHBASE_BUCKET
-        scope_name = config.COUCHBASE_SCOPE
-
-        # Helper function to build fully qualified collection name
-        def fqn(collection_name):
-            return f"`{bucket_name}`.`{scope_name}`.`{collection_name}`"
-
-        # Transaction indexes
-        indexes = [
-            # Transactions collection
-            (config.TRANSACTIONS_COLLECTION, "idx_transaction_id", ["transaction_id"]),
-            (config.TRANSACTIONS_COLLECTION, "idx_status_created", ["status", "created_at"]),
-            (config.TRANSACTIONS_COLLECTION, "idx_transaction_type", ["transaction_type"]),
-            (config.TRANSACTIONS_COLLECTION, "idx_amount", ["amount"]),
-            (config.TRANSACTIONS_COLLECTION, "idx_sender_customer", ["sender.customer_id"]),
-            (config.TRANSACTIONS_COLLECTION, "idx_sender_account", ["sender.account_number"]),
-            (config.TRANSACTIONS_COLLECTION, "idx_recipient_account", ["recipient.account_number"]),
-
-            # Decisions collection
-            (config.DECISIONS_COLLECTION, "idx_decision_transaction", ["transaction_id"]),
-            (config.DECISIONS_COLLECTION, "idx_decision_created", ["decision", "created_at"]),
-            (config.DECISIONS_COLLECTION, "idx_confidence_score", ["confidence_score"]),
-            (config.DECISIONS_COLLECTION, "idx_risk_score", ["risk_score"]),
-
-            # Accounts collection
-            (config.ACCOUNTS_COLLECTION, "idx_account_number", ["account_number"]),
-            (config.ACCOUNTS_COLLECTION, "idx_account_customer", ["customer_id"]),
-            (config.ACCOUNTS_COLLECTION, "idx_account_status", ["status"]),
-
-            # Journal collection
-            (config.JOURNAL_COLLECTION, "idx_journal_transaction", ["transaction_id"]),
-            (config.JOURNAL_COLLECTION, "idx_journal_status", ["status"]),
-            (config.JOURNAL_COLLECTION, "idx_journal_debit", ["debit_account", "timestamp"]),
-            (config.JOURNAL_COLLECTION, "idx_journal_credit", ["credit_account", "timestamp"]),
-
-            # Balance updates collection
-            (config.BALANCE_UPDATES_COLLECTION, "idx_balance_account", ["account_number", "timestamp"]),
-            (config.BALANCE_UPDATES_COLLECTION, "idx_balance_transaction", ["transaction_id"]),
-
-            # Holds collection
-            (config.HOLDS_COLLECTION, "idx_hold_account", ["account_number", "status"]),
-            (config.HOLDS_COLLECTION, "idx_hold_transaction", ["transaction_id"]),
-            (config.HOLDS_COLLECTION, "idx_hold_expires", ["expires_at"]),
-
-            # Rules collection
-            (config.RULES_COLLECTION, "idx_rule_status_priority", ["status", "priority"]),
-            (config.RULES_COLLECTION, "idx_rule_category", ["category"]),
-
-            # Human reviews collection
-            (config.HUMAN_REVIEWS_COLLECTION, "idx_review_transaction", ["transaction_id"]),
-            (config.HUMAN_REVIEWS_COLLECTION, "idx_review_status_priority", ["status", "priority"]),
-            (config.HUMAN_REVIEWS_COLLECTION, "idx_review_assigned", ["assigned_to"]),
-            (config.HUMAN_REVIEWS_COLLECTION, "idx_review_sla", ["sla_deadline"]),
-
-            # Notifications collection
-            (config.NOTIFICATIONS_COLLECTION, "idx_notification_status", ["status", "created_at"]),
-            (config.NOTIFICATIONS_COLLECTION, "idx_notification_transaction", ["transaction_id"]),
-
-            # Audit events collection
-            (config.AUDIT_EVENTS_COLLECTION, "idx_audit_timestamp", ["timestamp"]),
-            (config.AUDIT_EVENTS_COLLECTION, "idx_audit_transaction", ["transaction_id"]),
-            (config.AUDIT_EVENTS_COLLECTION, "idx_audit_type", ["event_type"]),
-            (config.AUDIT_EVENTS_COLLECTION, "idx_audit_customer", ["customer_id"]),
-
-            # System metrics collection
-            (config.SYSTEM_METRICS_COLLECTION, "idx_metrics_timestamp", ["timestamp"]),
-            (config.SYSTEM_METRICS_COLLECTION, "idx_metrics_name", ["metric_name", "timestamp"]),
-        ]
-
-        for collection_name, index_name, fields in indexes:
-            try:
-                # Create index using N1QL
-                fields_str = ", ".join([f"`{field}`" for field in fields])
-                query = f"CREATE INDEX {index_name} ON {fqn(collection_name)}({fields_str})"
-
-                db.cluster.query(query)
-                logger.info(f"Created index {index_name} on {collection_name}")
-            except Exception as e:
-                # Index might already exist
-                if "already exists" not in str(e).lower():
-                    logger.warning(f"Could not create index {index_name}: {e}")
-
-        logger.info("Indexes created successfully")
-
-    except Exception as e:
-        logger.error(f"Error creating indexes: {e}")
-
-
-def get_cluster():
-    """Get Couchbase cluster instance."""
-    return db.cluster
-
-
-def get_bucket():
-    """Get Couchbase bucket instance."""
-    return db.bucket
-
-
-def get_scope():
-    """Get Couchbase scope instance."""
-    return db.scope
-
-
-def get_collection(collection_name: str):
-    """Get a specific collection instance."""
-    return db.collections.get(collection_name)
-
-
-def get_sync_cluster():
-    """Get synchronous Couchbase cluster for Temporal activities."""
-    # Couchbase Python SDK 4.x is primarily synchronous
-    # with async operations available via acouchbase
-    return db.cluster
-
+def get_sync_cluster() -> Cluster:
+    """Get synchronous Couchbase cluster connection (for Streamlit)."""
+    global _sync_cluster
+    
+    if _sync_cluster is None:
+        # Validate connection string
+        if not config.COUCHBASE_CONNECTION_STRING:
+            raise ValueError("COUCHBASE_CONNECTION_STRING is not set. Please check your .env file.")
+        
+        if not config.COUCHBASE_USERNAME or not config.COUCHBASE_PASSWORD:
+            raise ValueError("COUCHBASE_USERNAME and COUCHBASE_PASSWORD must be set. Please check your .env file.")
+        
+        logger.info(f"Creating sync Couchbase connection: {config.COUCHBASE_CONNECTION_STRING}")
+        auth = PasswordAuthenticator(config.COUCHBASE_USERNAME, config.COUCHBASE_PASSWORD)
+        cluster_options = ClusterOptions(auth)
+        
+        _sync_cluster = Cluster(config.COUCHBASE_CONNECTION_STRING, cluster_options)
+        _sync_cluster.wait_until_ready(timedelta(seconds=30))
+        logger.info("✅ Sync Couchbase connection established")
+    
+    return _sync_cluster
 
 def get_sync_scope():
-    """Get synchronous scope for Temporal activities."""
-    return db.scope
+    """Get synchronous Couchbase scope (for Streamlit)."""
+    global _sync_scope
+    
+    if _sync_scope is None:
+        cluster = get_sync_cluster()
+        bucket = cluster.bucket(config.COUCHBASE_BUCKET)
+        _sync_scope = bucket.scope(config.COUCHBASE_SCOPE)
+        logger.info(f"✅ Sync scope opened: {config.COUCHBASE_SCOPE}")
+    
+    return _sync_scope
+
+# Make db accessible as module-level variable
+def get_db():
+    """Get database scope."""
+    if _db is None:
+        raise RuntimeError("Couchbase not connected. Call connect_to_couchbase() first.")
+    return _db
+
+# Module-level db accessor (for backward compatibility)
+# This will be set after connection
+db = None
+

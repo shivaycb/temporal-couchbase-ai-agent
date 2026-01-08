@@ -1,6 +1,6 @@
 # AI-Powered Transaction Processing System – Proof of Value
 
-Enterprise-grade financial fraud detection system that combines Couchbase vector search, Temporal workflows, and AWS Bedrock AI to demonstrate real-time transaction analysis and intelligent fraud detection capabilities.
+Enterprise-grade financial fraud detection system that combines Couchbase vector search, Temporal workflows, and OpenAI AI to demonstrate real-time transaction analysis and intelligent fraud detection capabilities.
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen) ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 
@@ -8,12 +8,12 @@ Enterprise-grade financial fraud detection system that combines Couchbase vector
 
 ```bash
 # 1. Clone the repository
-
+git clone https://github.com/
 cd maap-temporal-ai-agent-qs
 
 # 2. Configure environment (minimal setup)
 cp .env.example .env
-# Edit .env with your Couchbase connection string and AWS credentials
+# Edit .env with your Couchbase connection string and OpenAI credentials
 
 # 3. Run quick setup (creates venv, installs deps, starts Temporal on Docker and launch the app)
 ./scripts/quick_setup.sh
@@ -88,12 +88,10 @@ graph LR
     A[Transaction API] --> B[Temporal Workflow]
     B --> C[Couchbase]
     B --> D{AI Provider}
-    D -->|Option 2| D1[AWS Bedrock]
-    D -->|Option 1| D2[Groq]
+    D -->|Primary| D1[OpenAI]
     C --> E[Vector Search]
     C --> F[Graph Analysis]
     D1 --> G[Fraud Detection]
-    D2 --> G[Fraud Detection]
     G --> H{Decision}
     H -->|Approved| I[Process Transaction]
     H -->|Review| J[Human Queue]
@@ -106,16 +104,14 @@ graph LR
 - **FastAPI Backend** - REST API for transaction submission
 - **Temporal Worker** - Durable workflow execution engine
 - **Couchbase** - Document store with Full-Text Search and vector search capabilities
-- **Groq** - LLM provider for transaction analysis
-- **Voyage AI** - Finance-optimized embeddings (primary embedding provider)
-- **AWS Bedrock** - Claude for analysis, Cohere for embeddings (fallback provider)
+- **OpenAI** - LLM provider (GPT-4) for transaction analysis and embeddings (text-embedding-3-small)
 - **Streamlit Dashboard** - Real-time monitoring and review interface
 
 ### Integration Points
 
-- Couchbase Full-Text Search with 1024-dimensional vector indexes
+- Couchbase Full-Text Search with 1536-dimensional vector indexes
 - Temporal for workflow orchestration and retry logic
-- AWS Bedrock API for AI inference
+- OpenAI API for AI inference and embeddings
 - RESTful APIs for external system integration
 
 For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -127,7 +123,7 @@ For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITE
 - Python 3.11+
 - Docker & Docker Compose
 - Couchbase Server or Couchbase Capella (Cloud)
-- AWS account with Bedrock access
+- OpenAI API key
 - 8GB RAM minimum
 
 ### Quick Setup (Docker)
@@ -172,8 +168,9 @@ streamlit run app.py               # Terminal 3: Dashboard
 | `COUCHBASE_PASSWORD` | Couchbase password | - | ✅ |
 | `COUCHBASE_BUCKET` | Couchbase bucket name | - | ✅ |
 | `COUCHBASE_SCOPE` | Couchbase scope name | _default | ❌ |
-| `AWS_ACCESS_KEY_ID` | AWS credentials for Bedrock | - | ✅ |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key | - | ✅ |
+| `OPENAI_API_KEY` | OpenAI API key for LLM and embeddings | - | ✅ |
+| `OPENAI_MODEL` | OpenAI model for LLM (e.g., gpt-4o-mini) | gpt-4o-mini | ❌ |
+| `OPENAI_EMBEDDING_MODEL` | OpenAI embedding model | text-embedding-3-small | ❌ |
 | `CONFIDENCE_THRESHOLD_APPROVE` | Min confidence for auto-approval | 85 | ❌ |
 | `AUTO_APPROVAL_LIMIT` | Max amount for auto-approval | 50000 | ❌ |
 | `TEMPORAL_HOST` | Temporal server address | localhost:7233 | ❌ |
@@ -185,8 +182,6 @@ For complete configuration options, see [docs/CONFIGURATION.md](docs/CONFIGURATI
 ### Dashboard Interface
 
 The system includes a comprehensive Streamlit dashboard for monitoring and managing transactions:
-
-![Dashboard Overview](docs/images/ui-dashboard-main.png)
 
 **Key Features:**
 - 📊 **Real-time Metrics** - Monitor transaction volume, processing time, and AI confidence
@@ -318,7 +313,7 @@ For detailed evaluation procedures, see [docs/EVALUATION_GUIDE.md](docs/EVALUATI
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | Couchbase connection failed | Invalid connection string or credentials | Verify connection string, username, and password in .env |
-| Bedrock timeout errors | Missing AWS credentials | Ensure AWS keys are in .env file |
+| OpenAI API errors | Missing OpenAI API key | Ensure OPENAI_API_KEY is set in .env file |
 | Worker not processing | Temporal not running | Run `docker-compose up -d` in docker-compose/ |
 | Dashboard blank | API not accessible | Check API is running on port 8000 |
 | Vector search no results | Missing FTS index | Run `python -m scripts.setup_couchbase` |
@@ -339,7 +334,7 @@ For detailed troubleshooting, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING
 - Enable Couchbase encryption at rest and in-transit
 - Implement OAuth2/SAML authentication
 - Add rate limiting and DDoS protection
-- Configure AWS PrivateLink for Bedrock
+- Configure OpenAI API access and rate limits
 
 **CI/CD Pipeline:**
 - GitHub Actions for automated testing

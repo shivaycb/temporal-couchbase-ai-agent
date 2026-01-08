@@ -1,77 +1,52 @@
 """Configuration management for the application."""
 
 import os
+from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
-from typing import List
 
-load_dotenv()
+# Load .env file from project root
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(env_path)
 
 class Config:
-    # Couchbase
-    COUCHBASE_CONNECTION_STRING = os.getenv("COUCHBASE_CONNECTION_STRING", "couchbase://localhost")
-    COUCHBASE_USERNAME = os.getenv("COUCHBASE_USERNAME", "Administrator")
-    COUCHBASE_PASSWORD = os.getenv("COUCHBASE_PASSWORD", "password")
-    COUCHBASE_BUCKET = os.getenv("COUCHBASE_BUCKET", "transaction_ai_poc")
-    COUCHBASE_SCOPE = os.getenv("COUCHBASE_SCOPE", "_default")
-    # Collections remain the same but now within Couchbase bucket/scope
+    """Application configuration from environment variables."""
     
-    # Temporal
-    TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "temporal:7233")
-    TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", "default")
-    TEMPORAL_TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE", "transaction-processing-queue")
+    # Couchbase Configuration
+    COUCHBASE_CONNECTION_STRING: str = os.getenv("COUCHBASE_CONNECTION_STRING", "")
+    COUCHBASE_USERNAME: str = os.getenv("COUCHBASE_USERNAME", "")
+    COUCHBASE_PASSWORD: str = os.getenv("COUCHBASE_PASSWORD", "")
+    COUCHBASE_BUCKET: str = os.getenv("COUCHBASE_BUCKET", "transactions")
+    COUCHBASE_SCOPE: str = os.getenv("COUCHBASE_SCOPE", "_default")
     
-    # AWS
-    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+    # Collection Names
+    TRANSACTIONS_COLLECTION: str = os.getenv("TRANSACTIONS_COLLECTION", "transactions")
+    DECISIONS_COLLECTION: str = os.getenv("DECISIONS_COLLECTION", "decisions")
+    HUMAN_REVIEWS_COLLECTION: str = os.getenv("HUMAN_REVIEWS_COLLECTION", "human_reviews")
     
-    # AI Model Configuration
-    #AWS
-    BEDROCK_MODEL_VERSION = os.getenv("BEDROCK_MODEL_VERSION", "us.anthropic.claude-opus-4-1-20250805-v1:0")
+    # OpenAI Configuration
+    OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    
+    # Temporal Configuration
+    TEMPORAL_HOST: str = os.getenv("TEMPORAL_HOST", "localhost:7233")
+    TEMPORAL_NAMESPACE: str = os.getenv("TEMPORAL_NAMESPACE", "default")
+    TEMPORAL_TASK_QUEUE: str = os.getenv("TEMPORAL_TASK_QUEUE", "transaction-processing")
+    
+    # API Configuration
+    API_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:8000/api")
+    
+    # Business Rules
+    AUTO_APPROVAL_LIMIT: float = float(os.getenv("AUTO_APPROVAL_LIMIT", "50000"))
+    CONFIDENCE_THRESHOLD_APPROVE: float = float(os.getenv("CONFIDENCE_THRESHOLD_APPROVE", "85"))
+    SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.85"))
+    
+    # Legacy AWS/Bedrock fields (kept for backward compatibility, but not used)
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    BEDROCK_MODEL_VERSION: str = os.getenv("BEDROCK_MODEL_VERSION", "N/A (using OpenAI)")
+    GROQ_MODEL_ID: str = os.getenv("GROQ_MODEL_ID", "N/A (using OpenAI)")
 
-    #Groq
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    GROQ_MODEL_ID = os.getenv("GROQ_MODEL_ID", "openai/gpt-oss-120b")
-
-    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")  # Options: "groq", "bedrock"
-
-    # Embedding Configuration
-    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
-    VOYAGE_MODEL = "voyage-finance-2"
-    COHERE_MODEL = "cohere.embed-english-v3"
-    
-    # Collections
-    CUSTOMERS_COLLECTION = "customers"
-    TRANSACTIONS_COLLECTION = "transactions"
-    DECISIONS_COLLECTION = "transaction_decisions"
-    HUMAN_REVIEWS_COLLECTION = "human_reviews"
-    AUDIT_EVENTS_COLLECTION = "audit_events"
-    NOTIFICATIONS_COLLECTION = "notifications"
-    SYSTEM_METRICS_COLLECTION = "system_metrics"
-    RULES_COLLECTION = "rules"
-    ACCOUNTS_COLLECTION = "accounts"
-    JOURNAL_COLLECTION = "transaction_journal"
-    BALANCE_UPDATES_COLLECTION = "balance_updates"
-    HOLDS_COLLECTION = "balance_holds"
-    
-    # AI Settings
-    CONFIDENCE_THRESHOLD_APPROVE = float(os.getenv("CONFIDENCE_THRESHOLD_APPROVE", 85))
-    CONFIDENCE_THRESHOLD_ESCALATE = float(os.getenv("CONFIDENCE_THRESHOLD_ESCALATE", 70))
-    AUTO_APPROVAL_LIMIT = float(os.getenv("AUTO_APPROVAL_LIMIT", 50000))
-    
-    # High Risk Countries
-    HIGH_RISK_COUNTRIES: List[str] = ["RU","IR", "KP", "SY", "AF", "YE"]
-    
-    # Vector Search Settings
-    VECTOR_SEARCH_INDEX = "transaction_vector_index"
-    VECTOR_DIMENSION = 1024  # Cohere embedding dimension
-    MAX_SIMILAR_CASES = 10
-    SIMILARITY_THRESHOLD = 0.75
-    
-    # Application Settings
-    APP_ENV = os.getenv("APP_ENV", "development")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    # Use "http://api:8000/api" for Docker, "http://localhost:8000/api" for local
-    API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000/api")
-
+# Global config instance
 config = Config()
+

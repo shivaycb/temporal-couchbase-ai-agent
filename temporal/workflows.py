@@ -1,361 +1,355 @@
-"""Transaction processing workflow definition."""
+"""Temporal workflows for transaction processing with enhanced state management and resilience."""
 
+import logging
 from datetime import timedelta
-from typing import Dict, Any
+from typing import Optional, Dict, List
+from dataclasses import dataclass, field
+from enum import Enum
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporal.shared import TransactionDetails, DecisionResult
+from temporal.activities import (
+    generate_embedding,
+    analyze_transaction_with_ai,
+    search_similar_transactions,
+    save_decision,
+    update_transaction_status,
+    create_human_review,
+    apply_business_rules
+)
 
-# Use unsafe imports for non-deterministic code
-with workflow.unsafe.imports_passed_through():
-    from temporal.shared import (
-        TransactionDetails,
-        ProcessingResult
-    )
-    from temporal.activities import TransactionActivities
-    from utils.config import config
+logger = logging.getLogger(__name__)
+
+class WorkflowState(Enum):
+    """Workflow execution states."""
+    INITIALIZED = "initialized"
+    EMBEDDING_GENERATED = "embedding_generated"
+    SIMILAR_TRANSACTIONS_FOUND = "similar_transactions_found"
+    AI_ANALYSIS_COMPLETE = "ai_analysis_complete"
+    BUSINESS_RULES_APPLIED = "business_rules_applied"
+    DECISION_SAVED = "decision_saved"
+    STATUS_UPDATED = "status_updated"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ESCALATED = "escalated"
+
+@dataclass
+class WorkflowExecutionState:
+    """Workflow execution state for durability and recovery."""
+    transaction_id: str
+    current_state: WorkflowState = WorkflowState.INITIALIZED
+    embedding: Optional[List[float]] = None
+    similar_transactions: List[Dict] = field(default_factory=list)
+    decision_result: Optional[DecisionResult] = None
+    decision_id: Optional[str] = None
+    processing_time_ms: int = 0
+    error_message: Optional[str] = None
+    retry_count: int = 0
+    stages_completed: List[str] = field(default_factory=list)
 
 @workflow.defn
 class TransactionProcessingWorkflow:
-    """Workflow for AI-powered transaction processing."""
+    """Workflow for processing financial transactions with state management and resilience."""
     
     def __init__(self):
-        self.transaction_id = None
-        self.decision = None
-        self.awaiting_approval = False
-        self.approved_by = None
-        self.manual_override = None
+        self.state: Optional[WorkflowExecutionState] = None
+        self.human_review_decision: Optional[str] = None
+        self._human_review_signal_received = False
     
     @workflow.run
-    async def run(self, transaction_details: TransactionDetails) -> ProcessingResult:
-        """
-        Process a financial transaction through AI analysis and decision making.
+    async def run(self, transaction_details: TransactionDetails) -> Dict:
+        """Main workflow execution with state management and error recovery."""
+        # Use workflow.now() instead of datetime.now() for determinism
+        start_time = workflow.now()
+        self.state = WorkflowExecutionState(transaction_id=transaction_details.transaction_id)
         
-        Args:
-            transaction_details: Details of the transaction to process
-            
-        Returns:
-            ProcessingResult with decision and details
-        """
-        self.transaction_id = transaction_details.transaction_id
-        hold_id = None  # Initialize hold_id for cleanup in exception handlers
-        
-        # Configure retry policy
-        retry_policy = RetryPolicy(
-            maximum_attempts=5,
-            initial_interval=timedelta(seconds=1),
-            maximum_interval=timedelta(seconds=60),
-            backoff_coefficient=2
-        )
-        
-        activities = TransactionActivities()
+        workflow.logger.info(f"Starting transaction processing workflow for {self.state.transaction_id}")
         
         try:
-            # Step 1: Validate funds and place hold
-            funds_validation = await workflow.execute_activity(
-                activities.validate_and_hold_funds,
+            # Step 1: Generate embedding for vector search
+            await self._execute_with_state_tracking(
+                "generate_embedding",
+                self._generate_embedding,
                 transaction_details,
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=retry_policy
+                WorkflowState.EMBEDDING_GENERATED
             )
             
-            hold_id = funds_validation.get("hold_id")
-            
-            # Step 2: Enrich transaction data
-            enriched_data = await workflow.execute_activity(
-                activities.enrich_transaction_data,
+            # Step 2: Search for similar transactions
+            await self._execute_with_state_tracking(
+                "search_similar_transactions",
+                self._search_similar_transactions,
                 transaction_details,
-                start_to_close_timeout=timedelta(seconds=120),
-                retry_policy=retry_policy
+                WorkflowState.SIMILAR_TRANSACTIONS_FOUND
             )
             
-            # Step 2: Perform risk assessment
-            risk_assessment = await workflow.execute_activity(
-                activities.perform_risk_assessment,
-                enriched_data,
-                start_to_close_timeout=timedelta(seconds=120),
-                retry_policy=retry_policy
+            # Step 3: Apply business rules (compliance checks, amount limits, etc.)
+            await self._execute_with_state_tracking(
+                "apply_business_rules",
+                self._apply_business_rules,
+                transaction_details,
+                WorkflowState.BUSINESS_RULES_APPLIED
             )
             
-            # Step 3: Find similar historical transactions
-            similar_cases = await workflow.execute_activity(
-                activities.find_similar_transactions,
-                enriched_data,
-                start_to_close_timeout=timedelta(seconds=20),
-                retry_policy=retry_policy
-            )
-
-            # Step 3.5: Analyze fraud network patterns
-            network_analysis = await workflow.execute_activity(
-                activities.analyze_fraud_network,
-                enriched_data,
-                start_to_close_timeout=timedelta(seconds=120),
-                retry_policy=retry_policy
-            )
-
-            # Incorporate network analysis into risk assessment
-            if network_analysis.get("network_analysis_performed"):
-                network_risk_score = network_analysis.get("network_risk_score", 0)
-                if network_risk_score > 50:
-                    risk_assessment.risk_score = min(100, risk_assessment.risk_score + network_risk_score / 4)
-                    risk_assessment.risk_factors.extend(network_analysis.get("network_risk_factors", []))
-                    enriched_data["network_analysis"] = network_analysis
-
-            # Step 4: AI decision analysis
-            ai_result = await workflow.execute_activity(
-                activities.ai_decision_analysis,
-                args=[enriched_data, risk_assessment, similar_cases],
-                start_to_close_timeout=timedelta(seconds=120),
-                retry_policy=retry_policy
+            # Step 4: Analyze transaction with AI
+            await self._execute_with_state_tracking(
+                "analyze_transaction_with_ai",
+                self._analyze_transaction_with_ai,
+                transaction_details,
+                WorkflowState.AI_ANALYSIS_COMPLETE
             )
             
-            # Check if transaction requires manager approval (using direct config value)
-            auto_approval_limit = 50000.0  # Default value if config not available
-            try:
-                auto_approval_limit = config.AUTO_APPROVAL_LIMIT
-            except:
-                pass
+            # Step 5: Check if human review is needed
+            if self.state.decision_result and self.state.decision_result.decision == "escalate":
+                await self._handle_human_review(transaction_details)
             
-            # Convert amount to float for comparison
-            amount_value = float(transaction_details.amount) if isinstance(transaction_details.amount, str) else transaction_details.amount
-            if (amount_value > auto_approval_limit and
-                ai_result["decision"] == "approve"):
-                self.awaiting_approval = True
-                workflow.logger.info(f"Transaction {self.transaction_id} requires manager approval")
-                
-                # Wait for approval (with timeout)
-                try:
-                    approval_received = await workflow.wait_condition(
-                        lambda: not self.awaiting_approval,
-                        timeout=timedelta(hours=24)
-                    )
-                except TimeoutError:
-                    approval_received = False
-                
-                if not approval_received:
-                    ai_result["decision"] = "escalate"
-                    ai_result["reasoning"] += " | Approval timeout - escalated to human review"
+            # Step 6: Calculate processing time
+            # Use workflow.now() instead of datetime.now() for determinism
+            end_time = workflow.now()
+            duration = end_time - start_time
+            self.state.processing_time_ms = int(duration.total_seconds() * 1000)
             
-            # Check for manual override
-            if self.manual_override:
-                ai_result["decision"] = self.manual_override["decision"]
-                ai_result["reasoning"] += f" | Manual override by {self.manual_override['user']}"
-            
-            # Determine confidence threshold (with defaults)
-            confidence_threshold = 85.0  # Default
-            try:
-                confidence_threshold = config.CONFIDENCE_THRESHOLD_APPROVE
-            except:
-                pass
-            
-            # Step 5: Always store decision first
-            decision_id = await workflow.execute_activity(
-                activities.store_decision,
-                args=[
-                    transaction_details.transaction_id,
-                    ai_result,
-                    workflow.info().workflow_id,
-                    workflow.info().run_id
-                ],
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=retry_policy
+            # Step 7: Save decision
+            await self._execute_with_state_tracking(
+                "save_decision",
+                self._save_decision,
+                transaction_details,
+                WorkflowState.DECISION_SAVED
             )
             
-            # Step 6: Queue for review if needed
-            if ai_result["confidence"] < confidence_threshold and ai_result["decision"] != "reject":
-                # Low confidence - also queue for human review
-                review_id = await workflow.execute_activity(
-                    activities.queue_for_human_review,
-                    args=[transaction_details.transaction_id, ai_result],
-                    start_to_close_timeout=timedelta(seconds=60),
-                    retry_policy=retry_policy
-                )
-                
-                result = ProcessingResult(
-                    success=True,
-                    decision="escalate",
-                    confidence=ai_result["confidence"],
-                    message=f"Transaction escalated for human review (confidence: {ai_result['confidence']:.1f}%)",
-                    decision_id=decision_id,  # Use decision_id not review_id
-                    risk_score=risk_assessment.risk_score,
-                    processing_time_ms=ai_result.get("processing_time_ms", 0),
-                    workflow_id=workflow.info().workflow_id
-                )
-            else:
-                # High confidence or reject - use AI decision
-                
-                # Step 6a: Execute fund transfer if approved
-                if ai_result["decision"] == "approve":
-                    transfer_success = await workflow.execute_activity(
-                        activities.execute_fund_transfer,
-                        args=[
-                            transaction_details.transaction_id,
-                            transaction_details.sender.get("account_number"),
-                            transaction_details.recipient.get("account_number"),
-                            transaction_details.amount,
-                            hold_id
-                        ],
-                        start_to_close_timeout=timedelta(seconds=120),
-                        retry_policy=retry_policy
-                    )
-                    
-                    if not transfer_success:
-                        ai_result["decision"] = "reject"
-                        ai_result["reasoning"] += " | Fund transfer failed"
-                else:
-                    # Release hold if not approved - use cleanup activity
-                    try:
-                        await workflow.execute_activity(
-                            activities.cleanup_hold,
-                            hold_id,
-                            start_to_close_timeout=timedelta(seconds=60),
-                            retry_policy=retry_policy
-                        )
-                    except:
-                        workflow.logger.warning(f"Failed to cleanup hold {hold_id}")
-                
-                result = ProcessingResult(
-                    success=True,
-                    decision=ai_result["decision"],
-                    confidence=ai_result["confidence"],
-                    message=f"Transaction {ai_result['decision']} with {ai_result['confidence']:.1f}% confidence",
-                    decision_id=decision_id,
-                    risk_score=risk_assessment.risk_score,
-                    processing_time_ms=ai_result.get("processing_time_ms", 0),
-                    workflow_id=workflow.info().workflow_id
-                )
-            
-            # Step 7: Send notification
-            await workflow.execute_activity(
-                activities.send_notification,
-                args=[
-                    transaction_details.transaction_id,
-                    result.decision,
-                    result.message
-                ],
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=3)
+            # Step 8: Update transaction status
+            await self._execute_with_state_tracking(
+                "update_transaction_status",
+                self._update_transaction_status,
+                transaction_details,
+                WorkflowState.STATUS_UPDATED
             )
             
-            self.decision = result
-            return result
-
-        except ApplicationError as e:
-            # Check if it's an InsufficientFundsError wrapped in ApplicationError
-            if "InsufficientFundsError" in str(e) or "Insufficient funds" in str(e):
-                workflow.logger.error(f"Insufficient funds: {e}")
-                
-                result = ProcessingResult(
-                    success=False,
-                    decision="reject",
-                    confidence=100,
-                    message=f"Transaction rejected: {str(e)}",
-                    risk_score=100
-                )
-                
-                # Store rejection due to insufficient funds
-                await workflow.execute_activity(
-                    activities.store_decision,
-                    args=[
-                        transaction_details.transaction_id,
-                        {
-                            "decision": "reject",
-                            "confidence": 100,
-                            "reasoning": f"Insufficient funds: {str(e)}",
-                            "risk_factors": ["insufficient_funds"]
-                        },
-                        workflow.info().workflow_id,
-                        workflow.info().run_id
-                    ],
-                    start_to_close_timeout=timedelta(seconds=60),
-                    retry_policy=retry_policy
-                )
-                
-                self.decision = result
-                return result
-            else:
-                raise
+            self.state.current_state = WorkflowState.COMPLETED
+            workflow.logger.info(f"Completed workflow for {self.state.transaction_id} with decision: {self.state.decision_result.decision}")
             
-        except ActivityError as e:
-            workflow.logger.error(f"Activity error in transaction processing: {e}")
+            return {
+                "transaction_id": self.state.transaction_id,
+                "decision": self.state.decision_result.decision,
+                "confidence": self.state.decision_result.confidence,
+                "risk_score": self.state.decision_result.risk_score,
+                "decision_id": self.state.decision_id,
+                "processing_time_ms": self.state.processing_time_ms,
+                "state": self.state.current_state.value
+            }
             
-            # Cleanup hold if exists
-            if hold_id:
-                try:
-                    await workflow.execute_activity(
-                        activities.cleanup_hold,
-                        hold_id,
-                        start_to_close_timeout=timedelta(seconds=5),
-                        retry_policy=RetryPolicy(maximum_attempts=3)
-                    )
-                except:
-                    pass  # Best effort cleanup
-            
-            raise ApplicationError(
-                f"Failed to process transaction: {str(e)}",
-                non_retryable=True
-            )
         except Exception as e:
-            workflow.logger.error(f"Unexpected error: {e}")
+            workflow.logger.error(f"Error in workflow for {self.state.transaction_id}: {e}")
+            self.state.current_state = WorkflowState.FAILED
+            self.state.error_message = str(e)
             
-            # Cleanup hold if exists
-            if hold_id:
-                try:
-                    await workflow.execute_activity(
-                        activities.cleanup_hold,
-                        hold_id,
-                        start_to_close_timeout=timedelta(seconds=5),
-                        retry_policy=RetryPolicy(maximum_attempts=3)
-                    )
-                except:
-                    pass  # Best effort cleanup
-            
-            raise ApplicationError(
-                f"System error during transaction processing: {str(e)}",
-                non_retryable=True
+            # Compensation: Update transaction status to failed
+            try:
+                await workflow.execute_activity(
+                    update_transaction_status,
+                    args=[self.state.transaction_id, "failed"],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=1)
+                )
+            except:
+                pass
+            raise
+    
+    async def _generate_embedding(self, transaction_details: TransactionDetails) -> List[float]:
+        """Generate embedding activity wrapper."""
+        transaction_data = self._build_transaction_data(transaction_details)
+        
+        embedding = await workflow.execute_activity(
+            generate_embedding,
+            transaction_data,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=10),
+                maximum_attempts=3,
+                non_retryable_error_types=["ValueError", "TypeError"]
             )
+        )
+        self.state.embedding = embedding
+        return embedding
     
-    @workflow.signal
-    def approve(self, manager_name: str) -> None:
-        """Approve a transaction awaiting manager approval."""
-        self.approved_by = manager_name
-        self.awaiting_approval = False
-        workflow.logger.info(f"Transaction approved by {manager_name}")
+    async def _search_similar_transactions(self, transaction_details: TransactionDetails) -> List[Dict]:
+        """Search similar transactions activity wrapper."""
+        transaction_data = self._build_transaction_data(transaction_details)
+        
+        similar = await workflow.execute_activity(
+            search_similar_transactions,
+            args=[transaction_data, self.state.embedding],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=10),
+                maximum_attempts=3
+            )
+        )
+        self.state.similar_transactions = similar
+        return similar
     
-    @workflow.signal
-    def override_decision(self, decision: str, user: str, reason: str) -> None:
-        """Override the AI decision manually."""
-        self.manual_override = {
-            "decision": decision,
-            "user": user,
-            "reason": reason
+    async def _apply_business_rules(self, transaction_details: TransactionDetails) -> Dict:
+        """Apply business rules activity wrapper."""
+        transaction_data = self._build_transaction_data(transaction_details)
+        
+        rules_result = await workflow.execute_activity(
+            apply_business_rules,
+            transaction_data,
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=5),
+                maximum_attempts=2,
+                non_retryable_error_types=["ComplianceViolation"]
+            )
+        )
+        return rules_result
+    
+    async def _analyze_transaction_with_ai(self, transaction_details: TransactionDetails) -> DecisionResult:
+        """Analyze transaction with AI activity wrapper."""
+        transaction_data = self._build_transaction_data(transaction_details)
+        context = {
+            "similar_transactions": self.state.similar_transactions,
+            "embedding": self.state.embedding
         }
-        workflow.logger.info(f"Decision overridden to {decision} by {user}")
+        
+        decision_result = await workflow.execute_activity(
+            analyze_transaction_with_ai,
+            args=[transaction_data, context],
+            start_to_close_timeout=timedelta(seconds=90),  # Longer timeout for AI
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=2),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=30),
+                maximum_attempts=3
+            )
+        )
+        self.state.decision_result = decision_result
+        return decision_result
+    
+    async def _handle_human_review(self, transaction_details: TransactionDetails) -> None:
+        """Handle human review escalation."""
+        self.state.current_state = WorkflowState.ESCALATED
+        
+        # Create human review record
+        review_id = await workflow.execute_activity(
+            create_human_review,
+            args=[self.state.transaction_id, self.state.decision_result],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=2)
+        )
+        
+        workflow.logger.info(f"Created human review {review_id} for transaction {self.state.transaction_id}")
+        
+        # Wait for human review signal (with timeout)
+        try:
+            await workflow.wait_condition(
+                lambda: self._human_review_signal_received,
+                timeout=timedelta(days=7)  # 7 days for human review
+            )
+            
+            # Update decision based on human review
+            if self.human_review_decision:
+                self.state.decision_result.decision = self.human_review_decision
+                workflow.logger.info(f"Human review decision received: {self.human_review_decision}")
+        except TimeoutError:
+            workflow.logger.warning(f"Human review timeout for transaction {self.state.transaction_id}")
+            # Default to reject on timeout
+            self.state.decision_result.decision = "reject"
+            self.state.decision_result.reasoning["primary_reasoning"] = "Human review timeout - defaulting to reject"
+    
+    @workflow.signal
+    def human_review_complete(self, decision: str) -> None:
+        """Signal handler for human review completion."""
+        self.human_review_decision = decision
+        self._human_review_signal_received = True
+        workflow.logger.info(f"Human review signal received: {decision}")
     
     @workflow.query
-    def get_status(self) -> Dict[str, Any]:
-        """Get the current workflow status."""
-        status_dict = {
-            "transaction_id": self.transaction_id,
-            "awaiting_approval": self.awaiting_approval,
-            "approved_by": self.approved_by,
-            "decision": None
+    def get_state(self) -> Dict:
+        """Query handler to get current workflow state."""
+        if not self.state:
+            return {"status": "not_initialized"}
+        
+        return {
+            "transaction_id": self.state.transaction_id,
+            "current_state": self.state.current_state.value,
+            "decision": self.state.decision_result.decision if self.state.decision_result else None,
+            "confidence": self.state.decision_result.confidence if self.state.decision_result else None,
+            "stages_completed": self.state.stages_completed,
+            "error_message": self.state.error_message,
+            "retry_count": self.state.retry_count
         }
+    
+    async def _save_decision(self, transaction_details: TransactionDetails) -> str:
+        """Save decision activity wrapper."""
+        decision_id = await workflow.execute_activity(
+            save_decision,
+            args=[self.state.transaction_id, self.state.decision_result, self.state.processing_time_ms],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=10),
+                maximum_attempts=5  # More retries for critical database operation
+            )
+        )
+        self.state.decision_id = decision_id
+        return decision_id
+    
+    async def _update_transaction_status(self, transaction_details: TransactionDetails) -> None:
+        """Update transaction status activity wrapper."""
+        status_map = {
+            "approve": "approved",
+            "reject": "rejected",
+            "escalate": "pending_review"
+        }
+        new_status = status_map.get(self.state.decision_result.decision, "pending")
         
-        if self.decision:
-            # Convert ProcessingResult to dict safely
-            try:
-                status_dict["decision"] = {
-                    "success": self.decision.success,
-                    "decision": self.decision.decision,
-                    "confidence": self.decision.confidence,
-                    "message": self.decision.message,
-                    "decision_id": self.decision.decision_id,
-                    "risk_score": self.decision.risk_score,
-                    "processing_time_ms": self.decision.processing_time_ms,
-                    "workflow_id": self.decision.workflow_id
-                }
-            except:
-                status_dict["decision"] = str(self.decision)
-        
-        return status_dict
+        await workflow.execute_activity(
+            update_transaction_status,
+            args=[self.state.transaction_id, new_status],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=10),
+                maximum_attempts=5  # More retries for critical database operation
+            )
+        )
+    
+    async def _execute_with_state_tracking(
+        self,
+        stage_name: str,
+        func,
+        transaction_details: TransactionDetails,
+        next_state: WorkflowState
+    ):
+        """Execute a stage with state tracking and error handling."""
+        try:
+            self.state.retry_count = 0
+            result = await func(transaction_details)
+            self.state.current_state = next_state
+            self.state.stages_completed.append(stage_name)
+            return result
+        except Exception as e:
+            self.state.retry_count += 1
+            self.state.error_message = f"Error in {stage_name}: {str(e)}"
+            raise
+    
+    def _build_transaction_data(self, transaction_details: TransactionDetails) -> Dict:
+        """Build transaction data dictionary from TransactionDetails."""
+        return {
+            "transaction_id": transaction_details.transaction_id,
+            "transaction_type": transaction_details.transaction_type,
+            "amount": float(transaction_details.amount),
+            "currency": transaction_details.currency,
+            "sender": transaction_details.sender,
+            "recipient": transaction_details.recipient,
+            "risk_flags": transaction_details.risk_flags or [],
+            "metadata": transaction_details.metadata or {}
+        }

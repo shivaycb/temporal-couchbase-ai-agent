@@ -212,6 +212,27 @@ class AdvancedScenarios:
                     )
                 ],
                 "expected_outcome": "REJECT - High similarity to known fraud patterns detected by hybrid search triggers automatic rejection"
+            },
+            
+            # Scenario 9: Live Demo Test - Full Integration Test
+            {
+                "name": "Live Demo Test - Full Workflow Integration",
+                "description": "Complete end-to-end workflow test: Creates transaction, starts Temporal workflow, monitors progress, sends human review signal, and verifies results. Demonstrates all Temporal features including state management, signals, and durability.",
+                "transactions": [
+                    self._create_transaction(
+                        amount=1000.00,
+                        sender_name="Test Sender",
+                        recipient_name="Test Recipient",
+                        transaction_type="wire_transfer",
+                        metadata={
+                            "test": True,
+                            "integration_test": True,
+                            "live_demo": True
+                        }
+                    )
+                ],
+                "expected_outcome": "COMPLETE - Full workflow execution with all stages: embedding generation, similarity search, business rules, AI analysis, human review escalation, signal handling, decision saving, and status update. Demonstrates Temporal's durability and state management.",
+                "is_integration_test": True  # Special flag for integration test
             }
         ]
     
@@ -248,6 +269,10 @@ class AdvancedScenarios:
     
     async def run_scenario(self, scenario: Dict) -> Dict:
         """Execute a single scenario."""
+        # Check if this is the integration test scenario
+        if scenario.get("is_integration_test"):
+            return await self._run_integration_test(scenario)
+        
         results = {
             "scenario_name": scenario["name"],
             "description": scenario["description"],
@@ -295,6 +320,166 @@ class AdvancedScenarios:
         results["end_time"] = datetime.now(timezone.utc).isoformat()
         return results
     
+    async def _run_integration_test(self, scenario: Dict) -> Dict:
+        """Run the full integration test workflow."""
+        import sys
+        from pathlib import Path
+        
+        # Add project root to path
+        project_root = Path(__file__).parent.parent
+        sys.path.insert(0, str(project_root))
+        
+        from temporalio.client import Client
+        from temporal.workflows import TransactionProcessingWorkflow
+        from temporal.shared import TransactionDetails, TRANSACTION_PROCESSING_TASK_QUEUE
+        from database.connection import connect_to_couchbase
+        from database.repositories import TransactionRepository, DecisionRepository
+        from database.schemas import Transaction, TransactionStatus
+        import time
+        
+        results = {
+            "scenario_name": scenario["name"],
+            "description": scenario["description"],
+            "expected": scenario["expected_outcome"],
+            "transactions": [],
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "workflow_ids": [],
+            "integration_test_results": {}
+        }
+        
+        try:
+            # Step 1: Connect to Temporal
+            client = await Client.connect(
+                config.TEMPORAL_HOST,
+                namespace=config.TEMPORAL_NAMESPACE
+            )
+            
+            # Step 2: Connect to Couchbase
+            await connect_to_couchbase()
+            
+            # Step 3: Create test transaction
+            transaction_data = scenario["transactions"][0]
+            test_transaction = Transaction(
+                transaction_type=transaction_data["transaction_type"],
+                amount=transaction_data["amount"],
+                currency=transaction_data["currency"],
+                sender=transaction_data["sender"],
+                recipient=transaction_data["recipient"],
+                description="Live demo test transaction",
+                status=TransactionStatus.PENDING
+            )
+            
+            transaction_id = await TransactionRepository.create_transaction(test_transaction)
+            
+            # Step 4: Prepare workflow input
+            transaction_details = TransactionDetails(
+                transaction_id=transaction_id,
+                transaction_type=transaction_data["transaction_type"],
+                amount=str(transaction_data["amount"]),
+                currency=transaction_data["currency"],
+                sender=transaction_data["sender"],
+                recipient=transaction_data["recipient"],
+                risk_flags=[],
+                metadata=transaction_data.get("metadata", {})
+            )
+            
+            # Step 5: Start workflow
+            workflow_id = f"test-workflow-{transaction_id}"
+            handle = await client.start_workflow(
+                TransactionProcessingWorkflow.run,
+                transaction_details,
+                id=workflow_id,
+                task_queue=TRANSACTION_PROCESSING_TASK_QUEUE,
+            )
+            
+            results["workflow_ids"].append(workflow_id)
+            
+            # Step 6: Monitor workflow progress and send signal if needed
+            max_wait = 120  # 2 minutes max
+            start_time = time.time()
+            last_state = None
+            signal_sent = False
+            
+            while time.time() - start_time < max_wait:
+                try:
+                    state = await handle.query(TransactionProcessingWorkflow.get_state)
+                    current_state = state.get("current_state", "unknown")
+                    
+                    # If workflow is waiting for human review, send a signal
+                    if current_state == "escalated" and not signal_sent:
+                        await handle.signal(TransactionProcessingWorkflow.human_review_complete, "approve")
+                        signal_sent = True
+                        results["integration_test_results"]["signal_sent"] = True
+                    
+                    if current_state in ["completed", "failed"]:
+                        break
+                    
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    await asyncio.sleep(2)
+            
+            # Step 7: Get workflow result
+            try:
+                result = await asyncio.wait_for(handle.result(), timeout=60.0)
+                results["integration_test_results"]["workflow_result"] = {
+                    "decision": result.get("decision"),
+                    "confidence": result.get("confidence"),
+                    "risk_score": result.get("risk_score"),
+                    "processing_time_ms": result.get("processing_time_ms"),
+                    "decision_id": result.get("decision_id")
+                }
+                
+                # Verify decision in database
+                decision = await DecisionRepository.get_decision_by_transaction(transaction_id)
+                if decision:
+                    results["integration_test_results"]["decision_in_db"] = True
+                    results["integration_test_results"]["decision_details"] = {
+                        "decision": decision.get("decision"),
+                        "confidence": decision.get("confidence_score")
+                    }
+                
+                # Verify transaction status
+                transaction = await TransactionRepository.get_transaction(transaction_id)
+                if transaction:
+                    results["integration_test_results"]["transaction_status"] = transaction.get("status")
+                
+                results["transactions"].append({
+                    "transaction_id": transaction_id,
+                    "status": "completed",
+                    "workflow_id": workflow_id,
+                    "amount": float(transaction_data["amount"]),
+                    "decision": result.get("decision"),
+                    "processing_time_ms": result.get("processing_time_ms")
+                })
+                
+            except Exception as e:
+                # Error getting workflow result
+                import traceback
+                error_details = traceback.format_exc()
+                results["transactions"].append({
+                    "transaction_id": transaction_id if 'transaction_id' in locals() else "unknown",
+                    "status": "error",
+                    "error": str(e),
+                    "amount": float(transaction_data["amount"]) if 'transaction_data' in locals() else 0.0
+                })
+                results["integration_test_results"]["error"] = str(e)
+                results["integration_test_results"]["error_details"] = error_details
+        
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            results["transactions"].append({
+                "transaction_id": transaction_id if 'transaction_id' in locals() else "unknown",
+                "status": "error",
+                "error": str(e),
+                "amount": float(transaction_data["amount"]) if 'transaction_data' in locals() else 0.0
+            })
+            results["integration_test_results"]["error"] = str(e)
+            results["integration_test_results"]["error_details"] = error_details
+        
+        results["end_time"] = datetime.now(timezone.utc).isoformat()
+        return results
+    
     async def check_results(self, workflow_ids: List[str]) -> List[Dict]:
         """Check the results of submitted transactions."""
         results = []
@@ -331,7 +516,7 @@ async def main():
     print("\n" + "="*80)
     print("🚀 ADVANCED TRANSACTION PROCESSING SCENARIOS")
     print("="*80)
-    print(f"Demonstrating couchbaseDB Vector Search + Temporal Workflows")
+    print(f"Demonstrating couchbaseDB Cepalla Vector Search + Temporal Workflows")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*80)
     

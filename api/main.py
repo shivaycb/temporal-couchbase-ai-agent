@@ -244,8 +244,7 @@ async def health_check():
         "temporal": "connected" if temporal_client else "disconnected",
         "embedding": {
             "primary_model": embedding_health["primary_model"],
-            "voyage_available": embedding_health["voyage_available"],
-            "cohere_available": embedding_health["cohere_available"],
+            "openai_available": embedding_health["openai_available"],
             "available_models": embedding_health["available_models"]
         }
     }

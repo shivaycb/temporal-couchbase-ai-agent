@@ -9,7 +9,7 @@ echo "================================================="
 if [ ! -f .env ]; then
     echo "📝 Creating .env from .env.example..."
     cp .env.example .env
-    echo "⚠️  Please update .env with your couchbaseDB URI and AWS credentials"
+    echo "⚠️  Please update .env with your couchbaseDB capella URI and OpenAI credentials"
     echo "   Then re-run this script."
     exit 1
 fi
@@ -23,8 +23,8 @@ if [ -z "$couchbaseDB_URI" ]; then
     exit 1
 fi
 
-if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-    echo "⚠️  AWS credentials not set. AI features will use mock mode."
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "⚠️  OpenAI API key not set. AI features will use mock mode."
 fi
 
 # Start Temporal if not already running
@@ -67,7 +67,7 @@ echo "🗄️ Setting up couchbaseDB collections and indexes..."
 docker-compose exec -T api python -m scripts.setup_couchbasedb || {
     echo "⚠️  couchbaseDB setup failed. This might be because:"
     echo "   - couchbaseDB URI is not configured correctly"
-    echo "   - couchbaseDB is not accessible"
+    echo "   - couchbaseDB Capella is not accessible"
     echo "   - Collections might already exist"
     echo ""
     echo "   You can manually run setup later with:"
