@@ -44,41 +44,62 @@ async def ensure_couchbase_connection():
             logger.info("Couchbase connection established successfully")
         except Exception as conn_error:
             logger.error(f"Failed to establish Couchbase connection: {conn_error}")
-            raise RuntimeError(f"Couchbase connection failed: {conn_error}") from conn_error
+            from temporalio.exceptions import ApplicationError
+            # Raise as ApplicationError to allow retries
+            raise ApplicationError(
+                f"Couchbase connection failed: {str(conn_error)}",
+                type="ConnectionError",
+                non_retryable=False
+            ) from conn_error
 
 @activity.defn
 async def generate_embedding(transaction_data: Dict) -> List[float]:
     """Generate embedding for a transaction with activity heartbeat."""
+    from temporalio.exceptions import ApplicationError
+    
+    activity.logger.info(f"Generating embedding for transaction {transaction_data.get('transaction_id')}")
+    
+    # Create text representation of transaction
+    text = f"{transaction_data.get('transaction_type', '')} {transaction_data.get('amount', 0)} {transaction_data.get('currency', 'USD')} {transaction_data.get('sender', {}).get('name', '')} {transaction_data.get('recipient', {}).get('name', '')}"
+    
+    # Send heartbeat before API call
+    activity.heartbeat("starting_embedding_generation")
+    
     try:
-        activity.logger.info(f"Generating embedding for transaction {transaction_data.get('transaction_id')}")
-        
-        # Create text representation of transaction
-        text = f"{transaction_data.get('transaction_type', '')} {transaction_data.get('amount', 0)} {transaction_data.get('currency', 'USD')} {transaction_data.get('sender', {}).get('name', '')} {transaction_data.get('recipient', {}).get('name', '')}"
-        
-        # Send heartbeat before API call
-        activity.heartbeat("starting_embedding_generation")
-        
         embedding = embedding_client.generate_embedding(text)
         
-        if embedding:
-            activity.heartbeat("embedding_generated")
-            return embedding
-        else:
-            # Return mock embedding if API unavailable
-            activity.logger.warning("OpenAI API unavailable, using mock embedding")
-            return embedding_client._mock_embedding()
+        if not embedding:
+            # If API returns None/empty, raise error to trigger retry
+            raise ApplicationError(
+                "OpenAI API returned empty embedding",
+                type="EmbeddingGenerationError",
+                non_retryable=False
+            )
+        
+        activity.heartbeat("embedding_generated")
+        return embedding
+    except ApplicationError:
+        # Re-raise ApplicationError as-is
+        raise
     except Exception as e:
         activity.logger.error(f"Error generating embedding: {e}")
         activity.heartbeat(f"error: {str(e)}")
-        return embedding_client._mock_embedding()
+        # Raise ApplicationError to let Temporal handle retries
+        raise ApplicationError(
+            f"Failed to generate embedding: {str(e)}",
+            type="EmbeddingGenerationError",
+            non_retryable=False
+        ) from e
 
 @activity.defn
 async def analyze_transaction_with_ai(transaction_data: Dict, context: Optional[Dict] = None) -> DecisionResult:
     """Analyze transaction using AI with activity heartbeat."""
+    from temporalio.exceptions import ApplicationError
+    
+    activity.logger.info(f"Analyzing transaction {transaction_data.get('transaction_id')} with AI")
+    activity.heartbeat("starting_ai_analysis")
+    
     try:
-        activity.logger.info(f"Analyzing transaction {transaction_data.get('transaction_id')} with AI")
-        activity.heartbeat("starting_ai_analysis")
-        
         # Use LLM client to analyze transaction
         analysis = llm_client.analyze_transaction(transaction_data, context)
         
@@ -97,38 +118,46 @@ async def analyze_transaction_with_ai(transaction_data: Dict, context: Optional[
             },
             risk_factors=analysis["risk_factors"]
         )
+    except ApplicationError:
+        # Re-raise ApplicationError as-is
+        raise
     except Exception as e:
         activity.logger.error(f"Error analyzing transaction: {e}")
         activity.heartbeat(f"error: {str(e)}")
-        # Return default escalation decision on error
-        return DecisionResult(
-            decision="escalate",
-            confidence=50,
-            risk_score=50,
-            reasoning={
-                "primary_reasoning": f"Error during analysis: {str(e)}",
-                "risk_factors": ["analysis_error"]
-            },
-            risk_factors=["analysis_error"]
-        )
+        # Raise ApplicationError to let Temporal handle retries
+        raise ApplicationError(
+            f"Failed to analyze transaction with AI: {str(e)}",
+            type="AIAnalysisError",
+            non_retryable=False
+        ) from e
 
 @activity.defn
 async def search_similar_transactions(transaction_data: Dict, embedding: List[float]) -> List[Dict]:
     """Search for similar transactions using vector search with heartbeat."""
+    from temporalio.exceptions import ApplicationError
+    
+    activity.logger.info(f"Searching for similar transactions for {transaction_data.get('transaction_id')}")
+    activity.heartbeat("starting_vector_search")
+    
     try:
-        activity.logger.info(f"Searching for similar transactions for {transaction_data.get('transaction_id')}")
-        activity.heartbeat("starting_vector_search")
-        
         # TODO: Implement actual Couchbase vector search
         # This would use Couchbase FTS with vector similarity
-        # For now, return empty list as placeholder
+        # For now, return empty list as placeholder (this is intentional, not an error)
         
         activity.heartbeat("vector_search_complete")
         return []
+    except ApplicationError:
+        # Re-raise ApplicationError as-is
+        raise
     except Exception as e:
         activity.logger.error(f"Error searching similar transactions: {e}")
         activity.heartbeat(f"error: {str(e)}")
-        return []
+        # Raise ApplicationError to let Temporal handle retries
+        raise ApplicationError(
+            f"Failed to search similar transactions: {str(e)}",
+            type="VectorSearchError",
+            non_retryable=False
+        ) from e
 
 @activity.defn
 async def apply_business_rules(transaction_data: Dict) -> Dict:
@@ -169,12 +198,23 @@ async def apply_business_rules(transaction_data: Dict) -> Dict:
     except ValueError as e:
         # Non-retryable compliance violation
         activity.logger.error(f"Compliance violation: {e}")
-        raise
+        from temporalio.exceptions import ApplicationError
+        # Raise as non-retryable ApplicationError
+        raise ApplicationError(
+            f"Compliance violation: {str(e)}",
+            type="ComplianceViolation",
+            non_retryable=True
+        ) from e
     except Exception as e:
         activity.logger.error(f"Error applying business rules: {e}")
         activity.heartbeat(f"error: {str(e)}")
-        # Return default passed result on other errors
-        return {"passed": True, "violations": [], "flags": []}
+        from temporalio.exceptions import ApplicationError
+        # Raise ApplicationError to let Temporal handle retries
+        raise ApplicationError(
+            f"Failed to apply business rules: {str(e)}",
+            type="BusinessRulesError",
+            non_retryable=False
+        ) from e
 
 @activity.defn
 async def save_decision(transaction_id: str, decision_result: DecisionResult, processing_time_ms: int) -> str:
@@ -242,7 +282,13 @@ async def update_transaction_status(transaction_id: str, status: str) -> None:
     except Exception as e:
         activity.logger.error(f"Error updating transaction status: {e}")
         activity.heartbeat(f"error: {str(e)}")
-        raise
+        from temporalio.exceptions import ApplicationError
+        # Raise ApplicationError to let Temporal handle retries
+        raise ApplicationError(
+            f"Failed to update transaction status: {str(e)}",
+            type="StatusUpdateError",
+            non_retryable=False
+        ) from e
 
 @activity.defn
 async def create_human_review(transaction_id: str, decision_result: DecisionResult) -> str:
@@ -280,7 +326,13 @@ async def create_human_review(transaction_id: str, decision_result: DecisionResu
     except Exception as e:
         activity.logger.error(f"Error creating human review: {e}")
         activity.heartbeat(f"error: {str(e)}")
-        raise
+        from temporalio.exceptions import ApplicationError
+        # Raise ApplicationError to let Temporal handle retries
+        raise ApplicationError(
+            f"Failed to create human review: {str(e)}",
+            type="HumanReviewCreationError",
+            non_retryable=False
+        ) from e
 
 def _calculate_risk_score(transaction_data: Dict, analysis: Dict, context: Optional[Dict]) -> float:
     """Calculate comprehensive risk score based on multiple factors."""
